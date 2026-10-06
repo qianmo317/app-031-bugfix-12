@@ -4,6 +4,7 @@
 // - 利用率分母为整板面积，分子为零件净面积（不含锯路）
 import type {
   Board,
+  BoardTypeSummary,
   Job,
   NestResult,
   OffcutInfo,
@@ -15,6 +16,7 @@ import type {
 import { EPS, type Rect } from './geometry'
 import { buildSteps, simulate } from './cuts'
 import type { DSeg } from './cuts'
+import { grainAxisMm, usableSize } from './boards'
 
 interface Inst {
   part: Part
@@ -54,6 +56,8 @@ interface SheetState {
 function boardMatches(b: Board, p: Part): boolean {
   if (!p.boardId) return true
   if (b.id === p.boardId) return true
+  // 指定编号已不在库（老存档/外部脏数据）：按自动挑板处理，避免指向空气
+  if (!boardDefs.has(p.boardId)) return true
   if (b.kind === 'offcut') {
     const target = boardDefs.get(p.boardId)
     return !!target && target.thicknessMm === b.thicknessMm
@@ -80,10 +84,16 @@ export function nestJob(job: Job): NestResult {
   // 各板种实际开板数（用于库存补采提示）
   const openedCount = new Map<string, number>()
 
-  // 零件实例展开
+  // 零件实例展开（尺寸/数量非法的件不参与排样，直接登记为排不下并说明原因）
   const insts: Inst[] = []
+  const invalid = new Map<string, { part: Part; qty: number; reason: string }>()
   for (const p of job.parts) {
-    for (let k = 1; k <= Math.max(0, p.qty); k++) {
+    if (!(Number.isFinite(p.lenMm) && p.lenMm > 0 && Number.isFinite(p.widMm) && p.widMm > 0)) {
+      invalid.set(p.id, { part: p, qty: Math.max(1, p.qty || 1), reason: '零件长或宽不是正数，请在清单中修正后重排' })
+      continue
+    }
+    const qty = Math.max(0, Math.trunc(p.qty))
+    for (let k = 1; k <= qty; k++) {
       insts.push({ part: p, k, key: `${p.id}#${k}`, cabinet: p.cabinet || '未分组' })
     }
   }
@@ -163,6 +173,7 @@ export function nestJob(job: Job): NestResult {
     return gap >= -EPS && (gap <= EPS || gap >= kerf - EPS)
   }
   const orientsOf = (p: Part): Orient[] => {
+    // 长边沿板 x、短边沿板 y；纹理方向决定哪种朝向合法（与 boards.grainAxisMm 同一份结论）
     if (p.grain === 'length') return [{ pw: p.lenMm, ph: p.widMm, rotated: false }]
     if (p.grain === 'width') return [{ pw: p.widMm, ph: p.lenMm, rotated: false }]
     if (p.lenMm === p.widMm) return [{ pw: p.lenMm, ph: p.widMm, rotated: false }]
@@ -170,6 +181,30 @@ export function nestJob(job: Job): NestResult {
       { pw: p.lenMm, ph: p.widMm, rotated: false },
       { pw: p.widMm, ph: p.lenMm, rotated: true }
     ]
+  }
+
+  /** 排不下原因：板库为空 / 指定板幅面不够（按纹理方向分别点） / 纹理不可旋转。 */
+  const unplacedReason = (p: Part): string => {
+    if (boards.length === 0) return '板材库为空，请先添加板材后重排'
+    const g = grainAxisMm(p)
+    const candidates = boards.filter((b) => boardMatches(b, p))
+    const named = p.boardId ? boards.find((b) => b.id === p.boardId) : undefined
+    if (p.boardId && named) {
+      const { wMm, hMm } = usableSize(named, trim)
+      const over: string[] = []
+      if (g.along > wMm) over.push(`${g.alongName}边 ${g.along}mm 超出可用板长 ${wMm}mm`)
+      if (g.across > hMm) over.push(`${g.acrossName}边 ${g.across}mm 超出可用板宽 ${hMm}mm`)
+      const tail = over.length ? `：${over.join('；')}（已扣两侧修边 ${trim}mm）` : '或库存张数不足'
+      return `指定板材「${named.name}」排不下${tail}`
+    }
+    if (p.grain !== 'none') {
+      return p.grain === 'length'
+        ? '因纹理要求为竖纹（不可旋转），现有板材可用幅面排不下'
+        : '因纹理要求为横纹（不可旋转），现有板材可用幅面排不下'
+    }
+    return candidates.length === 0
+      ? '板材尺寸或库存不足，无法排下'
+      : '板材尺寸或库存不足，无法排下'
   }
 
   const unplaced = new Map<string, { part: Part; qty: number }>()
@@ -338,13 +373,28 @@ export function nestJob(job: Job): NestResult {
   // 组装 SheetResult
   const results: SheetResult[] = sheets.map((s) => buildSheet(s, kerf, trim))
 
-  // 统计
-  const boardsByType: Record<string, number> = {}
+  // 统计：按板种（boardId）汇总领料行，与板材库/排样挑中的板同源
+  const summaryMap = new Map<string, BoardTypeSummary>()
   let totalCost = 0
   for (const s of results) {
-    boardsByType[s.boardName] = (boardsByType[s.boardName] ?? 0) + 1
+    const cur = summaryMap.get(s.boardId)
+    if (cur) cur.sheets++
+    else
+      summaryMap.set(s.boardId, {
+        boardId: s.boardId,
+        name: s.boardName,
+        material: s.material,
+        thicknessMm: s.thicknessMm,
+        wMm: s.wMm,
+        hMm: s.hMm,
+        priceCents: s.priceCents,
+        sheets: 1
+      })
     totalCost += s.priceCents
   }
+  const boardSummaries = [...summaryMap.values()].sort(
+    (a, b) => b.sheets - a.sheets || a.thicknessMm - b.thicknessMm
+  )
   let exposedM = 0
   let normalM = 0
   for (const s of results) {
@@ -360,18 +410,25 @@ export function nestJob(job: Job): NestResult {
     }
   }
 
-  const unplacedList: UnplacedInfo[] = [...unplaced.values()].map((u) => ({
-    partId: u.part.id,
-    code: u.part.code,
-    name: u.part.name,
-    qty: u.qty,
-    reason:
-      u.part.grain === 'none'
-        ? '板材尺寸或库存不足，无法排下'
-        : u.part.grain === 'length'
-          ? '因纹理要求为竖纹（不可旋转），现有板材排不下'
-          : '因纹理要求为横纹（不可旋转），现有板材排不下'
-  }))
+  const unplacedList: UnplacedInfo[] = []
+  for (const inv of invalid.values()) {
+    unplacedList.push({
+      partId: inv.part.id,
+      code: inv.part.code,
+      name: inv.part.name,
+      qty: inv.qty,
+      reason: inv.reason
+    })
+  }
+  for (const u of unplaced.values()) {
+    unplacedList.push({
+      partId: u.part.id,
+      code: u.part.code,
+      name: u.part.name,
+      qty: u.qty,
+      reason: unplacedReason(u.part)
+    })
+  }
 
   const baselineBoards = shelfBaseline(job, boards, kerf, trim, results.length)
   const optimizedBoards = results.length
@@ -395,7 +452,7 @@ export function nestJob(job: Job): NestResult {
   return {
     sheets: results,
     boardsUsed: optimizedBoards,
-    boardsByType,
+    boardSummaries,
     edgeBandM: {
       exposed: Math.round(exposedM * 100) / 100,
       normal: Math.round(normalM * 100) / 100
@@ -406,6 +463,7 @@ export function nestJob(job: Job): NestResult {
     savedCents: Math.round(savedBoards * avgPrice),
     totalCostCents: totalCost,
     stockShortage,
+    inputSig: '', // 由 store 在入库时按当前输入盖章
     elapsedMs: Math.round(performance.now() - t0),
     generatedAt: Date.now()
   }

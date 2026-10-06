@@ -5,6 +5,19 @@ import type { Board, Job, Part } from '../types'
 import { nestJob } from './packing'
 import { simulate, countSawOps } from './cuts'
 import { guillotineViolation, type Rect } from './geometry'
+import {
+  grainAxisMm,
+  isDuplicateBoard,
+  jobInputSig,
+  migrateJob,
+  partFitsBoard,
+  partWarnings,
+  usableSize,
+  validateBoardFields,
+  validateJobForNest,
+  validatePartFields,
+  validateTrimMm
+} from './boards'
 
 export interface CheckResult {
   name: string
@@ -442,6 +455,120 @@ export function runSelfTest(): SelfTestReport {
   }
 
   const elapsedMs = Math.round(performance.now() - t0)
+
+  // 10) 板材库规则：同规格拒重、最后一种不许删（store 负责）、0/负长宽厚当场拦
+  {
+    const a = makeBoard({ id: 'a', name: '同板', wMm: 2440, hMm: 1220, thicknessMm: 18 })
+    const b = makeBoard({ id: 'b', name: '同板', wMm: 2440, hMm: 1220, thicknessMm: 18 })
+    const dup = isDuplicateBoard([a], b)
+    const badZero = validateBoardFields({ wMm: 0, hMm: 1220, thicknessMm: 18, priceCents: 0, quantity: 0 })
+    const badNeg = validateBoardFields({ wMm: 2440, hMm: -5, thicknessMm: 18, priceCents: 0, quantity: 0 })
+    const badPart = validatePartFields({ lenMm: 0, widMm: -10, qty: 1 })
+    const ok = !!dup && !!badZero && !!badNeg && !!badPart
+    add(
+      '同规格板禁止重复入库；长宽厚/零件长宽 0 或负数当场拦截',
+      ok,
+      ok
+        ? '重复规格、0/负板幅、0/负零件尺寸均被拒绝'
+        : `dup=${!!dup} 板0=${badZero ?? '过'} 板负=${badNeg ?? '过'} 件=${badPart ?? '过'}`
+    )
+  }
+
+  // 11) 修边量：两侧各扣一份，扣到没有可用幅面要拒绝
+  {
+    const b = makeBoard({ wMm: 120, hMm: 100, thicknessMm: 18 })
+    const okTrim = validateTrimMm(8, 3.2, [b]) === null
+    const badTrim = validateTrimMm(60, 3.2, [b]) !== null
+    const u = usableSize(b, 8)
+    const okSize = u.wMm === 104 && u.hMm === 84
+    add(
+      '修边两侧各扣一份；修边量比板还大时拒绝',
+      okTrim && badTrim && okSize,
+      `8mm 修边可用幅面 ${u.wMm}×${u.hMm}；60mm 修边 ${badTrim ? '已拒绝' : '误放行'}`
+    )
+  }
+
+  // 12) 提醒按纹理方向分别比可用板幅：横纹件宽超可用板长也要报
+  {
+    const b = makeBoard({ id: 'w1', wMm: 2440, hMm: 1220, thicknessMm: 18 })
+    // 横纹：wid 沿板长(x)。wid=2400 放得下 2440-16=2424；wid=2430 超 6mm 必须提醒
+    const fits = partFitsBoard(makePart({ lenMm: 500, widMm: 2400, grain: 'width' }), b, 8)
+    const overWidth = partFitsBoard(makePart({ lenMm: 500, widMm: 2430, grain: 'width' }), b, 8)
+    const jobW = makeJob([makePart({ code: 'WX', lenMm: 500, widMm: 2430, grain: 'width' })], {
+      boards: [b]
+    })
+    const warned = partWarnings(jobW).some((x) => x.text.includes('宽边') && x.text.includes('WX'))
+    // 竖纹件：len 沿板长
+    const gLen = grainAxisMm(makePart({ lenMm: 100, widMm: 50, grain: 'length' }))
+    const gWid = grainAxisMm(makePart({ lenMm: 100, widMm: 50, grain: 'width' }))
+    const okAxis = gLen.along === 100 && gLen.across === 50 && gWid.along === 50 && gWid.across === 100
+    add(
+      '横纹件宽边超出可用板长也提醒（按纹理方向分别比、扣两侧修边）',
+      fits && !overWidth && warned && okAxis,
+      `2400 横纹=${fits}、2430 横纹拦截=${!overWidth}、逐方向提醒=${warned}、纹理轴=${okAxis}`
+    )
+  }
+
+  // 13) 老存档兼容：空库接默认板、悬挂指定清回自动、旧结果作废
+  {
+    const old = {
+      id: 'old1',
+      name: '老项目',
+      createdAt: 1,
+      boards: [] as unknown[],
+      parts: [
+        { id: 'px', code: 'X', name: '悬空件', lenMm: 100, widMm: 100, qty: 1, grain: 'none', edgeBands: [], cabinet: '柜', exposed: false, boardId: 'ghost_id' },
+        { id: 'py', code: 'Y', name: '坏尺寸', lenMm: -3, widMm: 0, qty: 0, grain: 'bad' as never, edgeBands: [], cabinet: '柜', exposed: false }
+      ],
+      kerfMm: 3.2,
+      trimMm: 8,
+      result: { sheets: [] }
+    } as unknown as Job
+    const m = migrateJob(old, (s) => makeBoard(s))
+    const okBoards = m.boards.length >= 1
+    const px = m.parts.find((p) => p.id === 'px')!
+    const py = m.parts.find((p) => p.id === 'py')!
+    const okDangling = px.boardId === ''
+    const okSanitize = py.lenMm === -3 && py.qty === 1 && py.grain === 'none' // 坏尺寸保留给提醒，数量/纹理兜底
+    const okResult = m.result === undefined
+    const nestErr = validateJobForNest(m) // 空库已接上，但坏尺寸应阻止排样
+    add(
+      '老项目读回兼容：空库接默认板、悬挂板编号清回自动、旧结果作废、坏数据不崩',
+      okBoards && okDangling && okSanitize && okResult && !!nestErr,
+      `库 ${m.boards.length} 种；悬空指定="${px.boardId}"；坏件 qty=${py.qty}/grain=${py.grain}；旧结果=${m.result}; 排样闸=${nestErr}`
+    )
+  }
+
+  // 14) 结果与输入同结论：改库/删引用后签名变化，未重排取不到 boardsByType 式旧行
+  {
+    const b1 = makeBoard({ id: 's1', name: '板一', wMm: 2440, hMm: 1220, thicknessMm: 18 })
+    const b2 = makeBoard({ id: 's2', name: '板二', wMm: 2440, hMm: 1220, thicknessMm: 9 })
+    const job = makeJob(
+      [
+        makePart({ code: 'A', lenMm: 500, widMm: 500, qty: 1, boardId: b1.id }),
+        makePart({ code: 'B', lenMm: 500, widMm: 500, qty: 1, boardId: b2.id })
+      ],
+      { boards: [b1, b2] }
+    )
+    const r = nestJob(job)
+    r.inputSig = jobInputSig(job)
+    const sig0 = r.inputSig
+    const kinds0 = r.boardSummaries.map((x) => x.boardId).sort()
+    // 删掉被 B 指着的 9mm 板（A 路：B 回自动），重排后汇总行只可能含 18mm 板
+    job.parts[1].boardId = ''
+    job.boards = [b1]
+    const sig1 = jobInputSig(job)
+    const r2 = nestJob(job)
+    const kinds1 = new Set(r2.sheets.map((x) => x.boardId))
+    const stale = sig0 !== sig1
+    const ok = stale && kinds0.length === 2 && [...kinds1].every((id) => id === b1.id)
+    add(
+      '删板改件后输入签名变化；重排汇总只含在库板种，单据不残留已删板行',
+      ok,
+      `删前 ${kinds0.join('/')} → 删后 ${[...kinds1].join('/')}；签名变化=${stale}`
+    )
+  }
+
   const ok = checks.every((c) => c.ok)
   return { ok, elapsedMs, checks }
 }

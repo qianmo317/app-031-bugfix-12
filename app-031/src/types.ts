@@ -97,10 +97,23 @@ export interface UnplacedInfo {
   reason: string
 }
 
+/** 下料单/成本表上「按板种汇总」的一行：以 boardId 为身份，与板材库同源同结论。 */
+export interface BoardTypeSummary {
+  boardId: string
+  name: string
+  material: string
+  thicknessMm: number
+  wMm: number
+  hMm: number
+  priceCents: number
+  sheets: number
+}
+
 export interface NestResult {
   sheets: SheetResult[]
   boardsUsed: number
-  boardsByType: Record<string, number>
+  /** 按板种（boardId）汇总的领料行；库里删掉的板不可能出现在这里 */
+  boardSummaries: BoardTypeSummary[]
   edgeBandM: { exposed: number; normal: number }
   unplaced: UnplacedInfo[]
   baselineBoards: number // 随手排（朴素顺板）需要的张数
@@ -108,6 +121,8 @@ export interface NestResult {
   savedCents: number
   totalCostCents: number
   stockShortage: { boardId: string; boardName: string; need: number; have: number }[]
+  /** 生成此结果时的排样输入签名；与当前库/零件不一致即作废重排 */
+  inputSig: string
   elapsedMs: number
   generatedAt: number
 }

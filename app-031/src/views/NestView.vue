@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { getJob, runNest, applyAdjustment, registerOffcuts, useStore } from '../lib/store'
+import { getJob, runNest, applyAdjustment, registerOffcuts, useStore, isResultStale } from '../lib/store'
 import { toast } from '../lib/ui'
 import { printJob } from '../lib/print'
 import { pct, money } from '../lib/format'
@@ -11,6 +11,7 @@ import { cabinetFill, cabinetStroke } from '../lib/colors'
 const route = useRoute()
 const job = computed(() => getJob(route.params.id as string))
 const result = computed(() => job.value?.result)
+const stale = computed(() => (job.value ? isResultStale(job.value.id) : false))
 
 const activeSheet = ref(0)
 const sheet = computed(() => result.value?.sheets[activeSheet.value])
@@ -66,7 +67,11 @@ function registerAll(): void {
 
 function rerun(): void {
   if (!job.value) return
-  runNest(job.value)
+  const r = runNest(job.value)
+  if ('error' in r) {
+    toast(r.error, 'bad', 4200)
+    return
+  }
   activeSheet.value = 0
   toast('已重新排样', 'good')
 }
@@ -142,6 +147,9 @@ function printNest(): void {
 
 <template>
   <div v-if="job && result">
+    <div v-if="stale" class="alert warn">
+      ⚠️ 板材库或零件在上次排样后被改动，下面的结果已作废（下料单/成本表同样失效），请点「重新排样」。
+    </div>
     <!-- 总览条 -->
     <section class="panel kpi-bar">
       <div><b>{{ result.boardsUsed }}</b><span>板材（张）</span></div>

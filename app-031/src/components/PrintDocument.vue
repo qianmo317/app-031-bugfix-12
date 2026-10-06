@@ -49,9 +49,6 @@ const cabinetGroups = computed(() => {
 
 const grainText = (g: string): string =>
   g === 'length' ? '竖纹' : g === 'width' ? '横纹' : '无要求'
-
-const boardByName = (name: string) =>
-  job.value?.result?.sheets.find((x) => x.boardName === name)
 </script>
 
 <template>
@@ -134,13 +131,13 @@ const boardByName = (name: string) =>
             <tr><th>板材</th><th>规格(mm)</th><th>厚度</th><th>张数</th><th>单价</th><th>小计</th></tr>
           </thead>
           <tbody>
-            <tr v-for="(n, name) in job.result?.boardsByType" :key="name">
-              <td>{{ name }}</td>
-              <td>{{ boardByName(String(name))?.wMm }}×{{ boardByName(String(name))?.hMm }}</td>
-              <td>{{ boardByName(String(name))?.thicknessMm }}</td>
-              <td>{{ n }}</td>
-              <td>{{ money(boardByName(String(name))?.priceCents ?? 0) }}</td>
-              <td>{{ money((boardByName(String(name))?.priceCents ?? 0) * Number(n)) }}</td>
+            <tr v-for="row in job.result?.boardSummaries ?? []" :key="row.boardId">
+              <td>{{ row.name }}</td>
+              <td>{{ row.wMm }}×{{ row.hMm }}</td>
+              <td>{{ row.thicknessMm }}</td>
+              <td>{{ row.sheets }}</td>
+              <td>{{ money(row.priceCents) }}</td>
+              <td>{{ money(row.priceCents * row.sheets) }}</td>
             </tr>
           </tbody>
           <tfoot>

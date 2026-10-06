@@ -7,10 +7,15 @@ import {
   saveJob,
   runNest,
   newPart,
-  allStockTemplates
+  allStockTemplates,
+  addBoard,
+  updateBoard,
+  removeBoard,
+  isResultStale
 } from '../lib/store'
-import { uid, parsePartText, parseEdges, money } from '../lib/format'
+import { parsePartText, parseEdges, money } from '../lib/format'
 import { toast } from '../lib/ui'
+import { partWarnings, usableSize, validatePartFields, validateTrimMm } from '../lib/boards'
 import type { Board, EdgeSide, Part } from '../types'
 
 const route = useRoute()
@@ -42,41 +47,164 @@ const totalArea = computed(
 )
 
 const availableOffcuts = computed(() => state.offcuts.filter((o) => o.available))
+const templates = computed(() => allStockTemplates())
 
 function save(): void {
   if (job.value) saveJob(job.value)
 }
 
-function addBoard(): void {
-  if (!job.value) return
-  const t = allStockTemplates()[3] // 2745×1220
-  job.value.boards.push({ ...t, id: uid('b') } as Board)
-  save()
+// ── 板材库 ───────────────────────────────────────────────────────────────
+
+/** 模板下拉里已在库中的规格（同 名称/材质/长宽厚）禁选。 */
+function templateInLibrary(i: number): boolean {
+  const j = job.value
+  if (!j) return true
+  const t = templates.value[i]
+  return j.boards.some(
+    (b) =>
+      b.name === t.name &&
+      b.material === t.material &&
+      b.wMm === t.wMm &&
+      b.hMm === t.hMm &&
+      b.thicknessMm === t.thicknessMm
+  )
 }
+
 function onPickTemplate(e: Event): void {
   const sel = e.target as HTMLSelectElement
   const i = Number(sel.value)
   sel.selectedIndex = 0
-  if (i >= 0) addSpecificBoard(allStockTemplates()[i])
+  if (i < 0 || !job.value) return
+  const r = addBoard(job.value, templates.value[i])
+  if (!r.ok) toast(r.error, 'bad', 4000)
+  else toast('已添加板材', 'good')
 }
-function addSpecificBoard(t: ReturnType<typeof allStockTemplates>[number]): void {
+
+/** 自定义板：给一块空白规格，填完再校验；与库内同规格同样拒绝。 */
+function addCustomBoard(): void {
   if (!job.value) return
-  job.value.boards.push({ ...t, id: uid('b') } as Board)
+  const r = addBoard(job.value, {
+    name: '自定义板材 2440×1220×18',
+    wMm: 2440,
+    hMm: 1220,
+    thicknessMm: 18,
+    material: '自定义',
+    priceCents: 0
+  })
+  if (!r.ok) toast(r.error, 'bad', 4000)
+}
+
+/**
+ * 数值/文本字段编辑：记录原值 → 写入 → 走领域校验 → 失败弹错并回滚。
+ * 长宽厚 0/负数、改成重复规格、修边超板，当场拦住，存不进本机。
+ */
+type BoardPatchField = 'wMm' | 'hMm' | 'thicknessMm' | 'priceCents' | 'quantity' | 'name' | 'material'
+function editBoardField<K extends BoardPatchField>(b: Board, key: K, ev: Event): void {
+  const j = job.value
+  if (!j) return
+  const input = ev.target as HTMLInputElement
+  const prev = b[key]
+  const value = (key === 'name' || key === 'material' ? input.value : Number(input.value)) as Board[K]
+  const patch = { [key]: value } as Partial<Pick<Board, BoardPatchField>>
+  const res = updateBoard(j, b.id, patch)
+  if (res.ok) {
+    save()
+    return
+  }
+  if (res.error === '__CONFIRM_THICKNESS__') {
+    // 厚度改小：先点出是哪些件，操作者确认取舍后才提交
+    const list = res.referring!
+    const names = list.slice(0, 8).map((p) => p.code || p.name).join('、')
+    const more = list.length > 8 ? ` 等 ${list.length} 种` : ''
+    const ok = window.confirm(
+      `板材厚度将从 ${prev}mm 改小，以下 ${list.length} 种零件仍指定用它：\n` +
+        `${names}${more}\n\n` +
+        `这些件的用料要求会与改后的板不一致（可能按错误厚度开料）。确认仍要修改吗？\n` +
+        `（点「取消」保留原厚度，先去调整零件）`
+    )
+    if (ok) {
+      const forced = updateBoard(j, b.id, patch, true)
+      if (forced.ok) {
+        save()
+        return
+      }
+      toast(forced.error, 'bad', 4000)
+    }
+  } else {
+    toast(res.error, 'bad', 4000)
+  }
+  // 回滚输入框（store 里的值未变，强制把 DOM 值刷回去）
+  input.value = String(prev)
+}
+
+function onRemoveBoard(bId: string, name: string): void {
+  const j = job.value
+  if (!j) return
+  const probe = removeBoard(j, bId)
+  if (probe.ok) return
+  if (probe.error === '__CONFIRM_DELETE__') {
+    // 删板两条路的取舍，必须说清；本应用走 A 路
+    const list = probe.referring!
+    const names = list.slice(0, 8).map((p) => p.code || p.name).join('、')
+    const more = list.length > 8 ? ` 等 ${list.length} 种` : ''
+    const ok = window.confirm(
+      `「${name}」正被 ${list.length} 种零件指定使用：\n${names}${more}\n\n` +
+        `删除后这些零件的指定会被清掉、回到自动挑板：\n` +
+        `· 好处：当场就能删掉这块板；\n` +
+        `· 代价：这些件对板厚/材质的要求丢失，重排时可能被排到厚度或材质对不上的板上。\n\n` +
+        `另一条路是点「取消」，先把这些零件逐个改指到别的板，再回来删（用料要求不丢，但当下删不动）。\n\n` +
+        `确认删除并清除这些零件的指定？`
+    )
+    if (!ok) return
+    const done = removeBoard(j, bId, true)
+    if (!done.ok) {
+      toast(done.error, 'bad', 4000)
+      return
+    }
+    toast(`已删除「${name}」，${list.length} 种零件回到自动挑板，旧排样结果已作废，请重新排样`, 'good', 4200)
+    return
+  }
+  toast(probe.error, 'bad', 4000)
+}
+
+function onTrimInput(ev: Event): void {
+  const j = job.value
+  if (!j) return
+  const input = ev.target as HTMLInputElement
+  const prev = j.trimMm
+  const v = Number(input.value)
+  const err = validateTrimMm(v, j.kerfMm, j.boards)
+  if (err) {
+    toast(err, 'bad', 4200)
+    input.value = String(prev)
+    return
+  }
+  j.trimMm = v
   save()
 }
-function removeBoard(id: string): void {
-  if (!job.value) return
-  job.value.boards = job.value.boards.filter((b) => b.id !== id)
+function onKerfInput(ev: Event): void {
+  const j = job.value
+  if (!j) return
+  const input = ev.target as HTMLInputElement
+  const prev = j.kerfMm
+  const v = Number(input.value)
+  if (!(Number.isFinite(v) && v >= 0)) {
+    toast('锯路不能为负数', 'bad')
+    input.value = String(prev)
+    return
+  }
+  j.kerfMm = v
   save()
 }
-function toggleOffcut(id: string): void {
-  if (!job.value) return
-  const arr = job.value.useOffcutIds
-  const i = arr.indexOf(id)
-  if (i >= 0) arr.splice(i, 1)
-  else arr.push(id)
-  save()
+
+function usableText(bId: string): string {
+  const b = job.value!.boards.find((x) => x.id === bId)
+  if (!b) return ''
+  const u = usableSize(b, job.value!.trimMm)
+  return u.wMm > 0 && u.hMm > 0 ? `${Math.round(u.wMm)}×${Math.round(u.hMm)}` : '—'
 }
+
+// ── 零件 ─────────────────────────────────────────────────────────────────
 
 function addPart(): void {
   job.value?.parts.push(
@@ -94,7 +222,7 @@ function removePart(id: string): void {
 }
 function duplicatePart(p: Part): void {
   const idx = job.value!.parts.findIndex((x) => x.id === p.id)
-  job.value!.parts.splice(idx + 1, 0, { ...p, id: uid('p') })
+  job.value!.parts.splice(idx + 1, 0, { ...p, id: `p_${Math.random().toString(36).slice(2, 8)}` })
   save()
 }
 function toggleEdge(p: Part, e: EdgeSide): void {
@@ -104,17 +232,48 @@ function toggleEdge(p: Part, e: EdgeSide): void {
   save()
 }
 
-const warnings = computed<string[]>(() => {
-  const out: string[] = []
-  const j = job.value
-  if (!j) return out
-  const maxW = Math.max(...j.boards.map((b) => b.wMm))
-  for (const p of j.parts) {
-    const long = Math.max(p.lenMm, p.widMm)
-    if (long > maxW) out.push(`「${p.code}」长边 ${long} 超过板长 ${maxW}`)
+/** 零件长宽数量：0/负数当场拦住并回滚。 */
+function editPartNum(p: Part, key: 'lenMm' | 'widMm' | 'qty', ev: Event): void {
+  const input = ev.target as HTMLInputElement
+  const prev = p[key]
+  const v = Number(input.value)
+  const probe = { ...p, [key]: v }
+  const err = validatePartFields(probe)
+  if (err) {
+    toast(err, 'bad', 3000)
+    input.value = String(prev)
+    return
   }
-  return out
-})
+  p[key] = v as never
+  save()
+}
+
+function toggleJobOffcut(id: string): void {
+  if (!job.value) return
+  const arr = job.value.useOffcutIds
+  const i = arr.indexOf(id)
+  if (i >= 0) arr.splice(i, 1)
+  else arr.push(id)
+  save()
+}
+
+/** 指定板材下拉：只允许选库中现有条或「自动」，防止悬挂编号。 */
+function onPartBoardChange(p: Part, ev: Event): void {
+  const sel = ev.target as HTMLSelectElement
+  const v = sel.value
+  if (v && !job.value!.boards.some((b) => b.id === v)) {
+    sel.value = p.boardId || ''
+    toast('该板材已不在库中，请重新选择', 'bad')
+    return
+  }
+  p.boardId = v
+  save()
+}
+
+// 清单页提醒：尺寸非法 / 指定板缺失或放不下 / 全库无板可排 / 修边过大，
+// 一律按纹理方向分别比「扣完两侧修边的可用板幅」
+const warnings = computed(() => (job.value ? partWarnings(job.value) : []))
+const stale = computed(() => (job.value ? isResultStale(job.value.id) : false))
 
 function doImport(): void {
   if (!job.value) return
@@ -124,6 +283,7 @@ function doImport(): void {
     toast('没有可导入的行', 'bad')
     return
   }
+  // 与手动录入同一把尺：长宽非正的行解析器已剔除并在 importErr 里逐行点名
   const boardId = job.value.boards[0]?.id ?? ''
   const built = rows.map((r) =>
     newPart({
@@ -157,8 +317,12 @@ async function doNest(): Promise<void> {
   running.value = true
   try {
     const r = runNest(j)
+    if ('error' in r) {
+      toast(r.error, 'bad', 4200)
+      return
+    }
     if (r.unplaced.length > 0) {
-      toast(`${r.unplaced.length} 种零件未排下，请看排样页提示`, 'bad', 4200)
+      toast(`${r.unplaced.reduce((a, u) => a + u.qty, 0)} 件零件未排下，请看排样页提示`, 'bad', 4200)
     } else {
       toast(`排样完成：${r.boardsUsed} 张板，${r.elapsedMs}ms`, 'good')
     }
@@ -171,6 +335,15 @@ async function doNest(): Promise<void> {
 const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
 门板\t2200\t450\t2\t竖纹\t上下左右\t衣柜\t是
 层板\t550\t560\t4\t无\t左右\t衣柜\t否`
+
+/** 指定板材下拉里显示库内序号（同名多条已禁止，#序号 + 名称足以辨认）。 */
+function boardIndex(id: string): number {
+  return job.value ? job.value.boards.findIndex((b) => b.id === id) : -1
+}
+function boardTag(id: string): string {
+  const i = boardIndex(id)
+  return i >= 0 ? `#${i + 1}` : ''
+}
 </script>
 
 <template>
@@ -189,17 +362,20 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
       <div class="row wrap" style="align-items: flex-end">
         <label class="field" style="width: 130px">
           <span>锯路 kerf (mm)</span>
-          <input v-model.number="job.kerfMm" type="number" step="0.1" min="1" max="8" @change="save" />
+          <input :value="job.kerfMm" type="number" step="0.1" min="0" max="8" @change="onKerfInput" />
         </label>
         <label class="field" style="width: 130px">
-          <span>四周修边 (mm)</span>
-          <input v-model.number="job.trimMm" type="number" step="1" min="0" max="20" @change="save" />
+          <span>四周修边 (mm)，两侧各扣一份</span>
+          <input :value="job.trimMm" type="number" step="1" min="0" max="20" @change="onTrimInput" />
         </label>
         <label class="field row" style="margin-bottom: 10px">
           <input type="checkbox" v-model="job.batchByCabinet" @change="save" />
           <span style="margin: 0 0 0 6px">按柜体批次分组开料（同柜零件尽量连续排）</span>
         </label>
       </div>
+      <p class="small muted" style="margin: 6px 0 0">
+        尺寸单位均为毫米（mm），录入精度 1 位小数；可用板幅 = 板长/宽 − 2×修边。修边量填得比板子还大会被当场拒绝。
+      </p>
       <div v-if="availableOffcuts.length > 0">
         <h4 style="margin: 8px 0 6px; font-size: 13px">余料优先：勾选已登记余料作为小板材参与本单排样</h4>
         <div class="row wrap">
@@ -209,7 +385,7 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
             class="offcut-chip"
             :class="{ on: job.useOffcutIds.includes(o.id) }"
           >
-            <input type="checkbox" :checked="job.useOffcutIds.includes(o.id)" @change="toggleOffcut(o.id)" />
+            <input type="checkbox" :checked="job.useOffcutIds.includes(o.id)" @change="toggleJobOffcut(o.id)" />
             {{ o.wMm }}×{{ o.hMm}}×{{ o.thicknessMm }} {{ o.material }}（{{ o.jobName }}）
           </label>
         </div>
@@ -219,33 +395,49 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
     <!-- 板材库 -->
     <section class="panel" style="margin-bottom: 14px">
       <div class="row" style="margin-bottom: 8px">
-        <h3 style="font-size: 14px">板材库</h3>
+        <h3 style="font-size: 14px">板材库（{{ job.boards.length }} 种）</h3>
         <div class="spacer" />
-        <select style="width: 260px" @change="onPickTemplate">
+        <select style="width: 300px" @change="onPickTemplate">
           <option value="-1">＋ 从常用规格添加…</option>
-          <option v-for="(t, i) in allStockTemplates()" :key="i" :value="i">{{ t.name }} {{ money(t.priceCents) }}</option>
+          <option v-for="(t, i) in templates" :key="i" :value="i" :disabled="templateInLibrary(i)">
+            {{ templateInLibrary(i) ? '（库中已有）' : '' }}{{ t.name }} {{ money(t.priceCents) }}
+          </option>
         </select>
-        <button class="sm" @click="addBoard">添加自定义板</button>
+        <button class="sm" @click="addCustomBoard">添加自定义板</button>
       </div>
+      <p class="small muted" style="margin: 0 0 8px">
+        同名称/材质/长/宽/厚的板只允许一条；改板、删板会同步影响零件指定、排样与下料单——改动后旧排样结果立即作废，需重新排样。
+      </p>
       <table class="grid board-table">
         <thead>
           <tr>
+            <th style="width: 36px">#</th>
             <th>名称/材质</th><th>长(mm)</th><th>宽(mm)</th><th>厚(mm)</th>
+            <th>可用幅面(扣两侧修边)</th>
             <th>单价</th><th>库存张数(0=不限)</th><th></th>
           </tr>
         </thead>
         <tbody>
-          <tr v-for="b in job.boards" :key="b.id">
+          <tr v-for="(b, bi) in job.boards" :key="b.id">
+            <td class="muted small">{{ bi + 1 }}</td>
             <td>
-              <input v-model="b.name" @change="save" />
-              <input v-model="b.material" @change="save" class="sub-input" placeholder="材质" />
+              <input :value="b.name" @change="editBoardField(b, 'name', $event)" />
+              <input :value="b.material" class="sub-input" placeholder="材质" @change="editBoardField(b, 'material', $event)" />
             </td>
-            <td style="width: 96px"><input v-model.number="b.wMm" type="number" @change="save" /></td>
-            <td style="width: 96px"><input v-model.number="b.hMm" type="number" @change="save" /></td>
-            <td style="width: 84px"><input v-model.number="b.thicknessMm" type="number" @change="save" /></td>
-            <td style="width: 110px"><input v-model.number="b.priceCents" type="number" @change="save" /></td>
-            <td style="width: 130px"><input v-model.number="b.quantity" type="number" min="0" @change="save" /></td>
-            <td style="width: 46px"><button class="sm ghost-danger" @click="removeBoard(b.id)">删</button></td>
+            <td style="width: 96px"><input :value="b.wMm" type="number" @change="editBoardField(b, 'wMm', $event)" /></td>
+            <td style="width: 96px"><input :value="b.hMm" type="number" @change="editBoardField(b, 'hMm', $event)" /></td>
+            <td style="width: 84px"><input :value="b.thicknessMm" type="number" @change="editBoardField(b, 'thicknessMm', $event)" /></td>
+            <td class="small muted" style="white-space: nowrap">{{ usableText(b.id) }}</td>
+            <td style="width: 110px"><input :value="b.priceCents" type="number" @change="editBoardField(b, 'priceCents', $event)" /></td>
+            <td style="width: 130px"><input :value="b.quantity" type="number" min="0" @change="editBoardField(b, 'quantity', $event)" /></td>
+            <td style="width: 46px">
+              <button
+                class="sm ghost-danger"
+                :disabled="job.boards.length <= 1"
+                :title="job.boards.length <= 1 ? '库里至少要保留一种板' : '删除该板'"
+                @click="onRemoveBoard(b.id, b.name)"
+              >删</button>
+            </td>
           </tr>
         </tbody>
       </table>
@@ -264,7 +456,7 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
       <div v-if="importOpen" class="import-box">
         <p class="small muted">
           支持 Excel 直接粘贴（制表符分隔），列：名称/长/宽/数量/纹理(竖|横|无)/封边(上下左右)/柜体/见光(是)。
-          无表头时按「名称,长,宽,数量,纹理,封边,柜体,见光」顺序解析。
+          无表头时按「名称,长,宽,数量,纹理,封边,柜体,见光」顺序解析。长或宽 ≤0 的行会被拒绝并逐行提示。
         </p>
         <textarea v-model="importText" rows="6" :placeholder="sampleTsv"></textarea>
         <p v-for="(e, i) in importErr" :key="i" class="small" style="color: var(--c-bad)">{{ e }}</p>
@@ -276,8 +468,11 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
         </div>
       </div>
 
+      <div v-if="stale" class="warn-box">
+        ⚠️ 板材库或零件在上次排样后被改动，旧排样结果与下料单已作废，请重新排样后再打印/导出。
+      </div>
       <div v-if="warnings.length > 0" class="warn-box">
-        <div v-for="(w, i) in warnings" :key="i">⚠️ {{ w }}</div>
+        <div v-for="(w, i) in warnings" :key="i">⚠️ {{ w.text }}</div>
       </div>
 
       <div class="table-scroll">
@@ -293,17 +488,17 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
               <th style="width: 132px">封边</th>
               <th style="width: 110px">柜体/房间</th>
               <th style="width: 70px">见光</th>
-              <th style="width: 130px">指定板材</th>
+              <th style="width: 150px">指定板材</th>
               <th style="width: 78px"></th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="p in job.parts" :key="p.id">
-              <td><input v-model="p.code" @change="save" /></td>
-              <td><input v-model="p.name" @change="save" /></td>
-              <td><input v-model.number="p.lenMm" type="number" min="1" @change="save" /></td>
-              <td><input v-model.number="p.widMm" type="number" min="1" @change="save" /></td>
-              <td><input v-model.number="p.qty" type="number" min="1" @change="save" /></td>
+              <td><input :value="p.code" @change="(e) => { p.code = (e.target as HTMLInputElement).value; save() }" /></td>
+              <td><input :value="p.name" @change="(e) => { p.name = (e.target as HTMLInputElement).value; save() }" /></td>
+              <td><input :value="p.lenMm" type="number" min="1" @change="editPartNum(p, 'lenMm', $event)" /></td>
+              <td><input :value="p.widMm" type="number" min="1" @change="editPartNum(p, 'widMm', $event)" /></td>
+              <td><input :value="p.qty" type="number" min="1" @change="editPartNum(p, 'qty', $event)" /></td>
               <td>
                 <select v-model="p.grain" @change="save">
                   <option v-for="(lab, g) in grainLabel" :key="g" :value="g">{{ lab }}</option>
@@ -317,12 +512,12 @@ const sampleTsv = `名称\t长\t宽\t数量\t纹理\t封边\t柜体\t见光
                   </label>
                 </div>
               </td>
-              <td><input v-model="p.cabinet" @change="save" /></td>
+              <td><input :value="p.cabinet" @change="(e) => { p.cabinet = (e.target as HTMLInputElement).value; save() }" /></td>
               <td style="text-align: center"><input type="checkbox" v-model="p.exposed" @change="save" /></td>
               <td>
-                <select v-model="p.boardId" @change="save">
+                <select :value="p.boardId" @change="onPartBoardChange(p, $event)">
                   <option value="">自动</option>
-                  <option v-for="b in job.boards" :key="b.id" :value="b.id">{{ b.name }}</option>
+                  <option v-for="b in job.boards" :key="b.id" :value="b.id">{{ boardTag(b.id) }} {{ b.name }}</option>
                 </select>
               </td>
               <td>
