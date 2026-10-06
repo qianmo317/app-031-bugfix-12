@@ -58,10 +58,33 @@ type CutStep = { boardIndex: number; axis: 'v'|'h'; at: number; span: [number, n
 type SheetResult = { index: number; boardId: string; placements: Placement[]; steps: CutStep[];
                      usedAreaMm2: number; boardAreaMm2: number; utilization: number;
                      offcuts: { wMm: number; hMm: number; areaMm2: number }[] };
-type Job = { id: string; boards: Board[]; parts: Part[]; kerfMm: number; trimMm: number;
-             result?: { sheets: SheetResult[]; boardsUsed: number; boardsByType: Record<string, number>;
+type Job = { id: string; name: string; createdAt: number; schemaVersion?: number;
+             boards: Board[]; parts: Part[]; kerfMm: number; trimMm: number;
+             autoBoardKey?: string; /* 自动挑板组：厚度|材质 */
+             useOffcutIds: string[]; batchByCabinet: boolean;
+             result?: { sheets: SheetResult[]; boardsUsed: number;
+                        boardSummary: BoardSummary[]; /* 按库内 boardId 汇总，单据/成本共用 */
                         edgeBandM: { exposed: number; normal: number } } };
+type BoardSummary = { boardId: string; boardName: string; material: string; thicknessMm: number;
+                      wMm: number; hMm: number; sheets: number;
+                      priceCents: number; subtotalCents: number };
 ```
+
+### 板材库一致性规则（库 / 零件提醒 / 排样 / 下料单必须是同一份结论）
+- **默认库**：新建项目自带三种板——18mm 厚板（颗粒板 2440×1220）、25mm 厚板、9mm 背板。
+- **不可重复**：同规格（长×宽×厚×材质，长宽交换视为同一种）不许二次入库。
+- **最后一种板不许删**：库至少保留一种板；删空后没有可排之板的情况从根上杜绝。
+- **删板两条路（只能选一条，取舍必须在确认弹窗写明）**：
+  1. 有零件正指定该板时**默认拦住**，要求先把零件改指别的板/改回自动——保住用料要求，代价是当场删不动；
+  2. 操作者显式选择**清空这些件的指定再删**——当场能删，代价是这些件回到自动挑板、对厚度/材质的要求丢失。
+  两条路都会作废旧排样（错误版本一旦写回存档并导出领料单，存档里的悬空指针与已发单据都要作废重来）。
+- **改厚度/材质**：厚度改小或材质变更（影响自动挑板分组）时，先点出受影响的零件清单，确认后才写回本机存储并作废旧排样。
+- **输入校验（当场拦截，不落库）**：板长/板宽/厚度/零件长宽/数量为零或负数一律拒绝；修边量必须非负且两侧各扣一份后任一板种仍有 ≥50mm 可用幅；锯路 1.0~8.0mm。
+- **单位与精度**：板幅/零件长宽/厚度/修边量为整数毫米；锯路 1 位小数（默认 3.2）；单价存分；可用板幅 = 板长 − 2×trim、板宽 − 2×trim；封边米 2 位、利用率百分数 1 位、面积 m² 2 位。
+- **自动挑板分组**：未指定板材的零件只在同 `厚度|材质` 的板（含同组登记余料）之间挑选，默认组为 18mm 颗粒板；9mm 背板只能由显式指定的背板件使用，柜体件不会被排上背板。
+- **零件提醒按纹理方向分别比可用板幅**：竖纹比「长边 ≤ 可用板长 且 短边 ≤ 可用板宽」；横纹比「长边 ≤ 可用板宽 且 短边 ≤ 可用板长」；无纹理允许旋转。旧版只比长边对板长、横纹宽超幅不提醒的问题必须修掉。
+- **联动刷新**：库的增删改、零件增删改、修边/锯路修改一律作废当前 `result`；下料单/成本表的按板种行来自 `boardSummary`（键是库内 boardId，不依赖可重复的名称），库里删掉的板不可能残留在单据上。
+- **旧存档兼容读回（schemaVersion v2 迁移）**：库为空补默认三种板；库只剩一种板时保留并补齐；同规格重复合并为一条、指向被合并 id 的零件改指保留板；零件指向已不在库的编号则清回自动；零/负/非法数值纠正或剔除；库被动过时旧排样与单据作废。迁移产生的提示在首页列给操作者。
 
 ## 8. 关键实现点
 - **guillotine 约束（本工具的核心）**：排样必须能由一系列**贯通直线切割**完成。采用「递归二分 / 分层」策略，禁止把零件塞进不规则缝隙；每生成一步都要验证切割线贯穿当前矩形。**必须写自动化断言**（随机用例 100 组，零反例）。
@@ -87,6 +110,10 @@ type Job = { id: string; boards: Board[]; parts: Part[]; kerfMm: number; trimMm:
 - 封边米数：与逐件手工累加一致（±0.1m）；见光/非见光分列正确。
 - 裁切步骤：30 零件步骤数 ≤ 20，且按步骤模拟切割后得到的零件尺寸全部正确（模拟器断言，这是最关键的验证）。
 - 余料：登记后作为可用小板参与下一轮排样（用例）。
+- 板材库：同规格重复添加被拒绝；最后一种板删除被拒绝；有零件引用的板删除走「拦住/清空指定」二选一确认且受影响件被逐条列出；厚度改小/材质变更先列件再确认；零负数尺寸与超板修边当场拦截（断言）。
+- 纹理提醒：横纹件长边超可用板宽、竖纹件长边超可用板长都要提醒；未排下原因按纹理方向给出超限边与超出毫米数（断言）。
+- 一致性：下料单/成本表的板种行均来自 `boardSummary`（boardId 键），库改后旧 result 作废、单据上不出现已删板；自动件只在同厚度同材质组内排（断言）。
+- 旧档迁移：空库/单板库、悬空 boardId、重复板、零负尺寸读回后按默认值接上，迁移有提示，被修补的项目旧排样作废（断言）。
 - 300 零件排样 < 1.5s。
 
 ## 11. 边界（刻意不做）

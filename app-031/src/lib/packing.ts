@@ -4,6 +4,7 @@
 // - 利用率分母为整板面积，分子为零件净面积（不含锯路）
 import type {
   Board,
+  BoardSummary,
   Job,
   NestResult,
   OffcutInfo,
@@ -15,6 +16,7 @@ import type {
 import { EPS, type Rect } from './geometry'
 import { buildSteps, simulate } from './cuts'
 import type { DSeg } from './cuts'
+import { boardAutoKey } from './boards'
 
 interface Inst {
   part: Part
@@ -51,8 +53,12 @@ interface SheetState {
   placements: Placement[]
 }
 
-function boardMatches(b: Board, p: Part): boolean {
-  if (!p.boardId) return true
+function boardMatches(b: Board, p: Part, autoKey: string): boolean {
+  if (!p.boardId) {
+    // 自动挑板：只在同厚度、同材质的板组之间选（含同规格登记余料）
+    if (b.kind === 'offcut') return boardAutoKey(b) === autoKey
+    return boardAutoKey(b) === autoKey
+  }
   if (b.id === p.boardId) return true
   if (b.kind === 'offcut') {
     const target = boardDefs.get(p.boardId)
@@ -69,13 +75,14 @@ function normalize(b: Board): Board {
   return { ...b, wMm: b.hMm, hMm: b.wMm }
 }
 
-export function nestJob(job: Job): NestResult {
+export function nestJob(job: Job, autoKey?: string): NestResult {
   const t0 = performance.now()
   boardDefs.clear()
   const boards = job.boards.map(normalize)
   boards.forEach((b) => boardDefs.set(b.id, b))
   const kerf = job.kerfMm
   const trim = job.trimMm
+  const aKey = autoKey ?? job.autoBoardKey ?? boardAutoKey(boards.find((b) => b.kind !== 'offcut') ?? boards[0])
 
   // 各板种实际开板数（用于库存补采提示）
   const openedCount = new Map<string, number>()
@@ -140,7 +147,7 @@ export function nestJob(job: Job): NestResult {
     const viable = boards.filter(
       (b) =>
         canOpen(b) &&
-        boardMatches(b, p) &&
+        boardMatches(b, p, aKey) &&
         fitsClean(b.wMm - 2 * trim, pw) &&
         fitsClean(b.hMm - 2 * trim, ph)
     )
@@ -188,7 +195,7 @@ export function nestJob(job: Job): NestResult {
     for (const o of orientsOf(p)) {
       // tier 0：已打开的、板种匹配的板里最贴合的空档
       for (const s of sheets) {
-        if (!boardMatches(s.board, p)) continue
+        if (!boardMatches(s.board, p, aKey)) continue
         for (const fr of s.free) {
           if (fitsClean(fr.w, o.pw) && fitsClean(fr.h, o.ph)) {
             const waste = fr.w * fr.h - o.pw * o.ph
@@ -338,13 +345,31 @@ export function nestJob(job: Job): NestResult {
   // 组装 SheetResult
   const results: SheetResult[] = sheets.map((s) => buildSheet(s, kerf, trim))
 
-  // 统计
-  const boardsByType: Record<string, number> = {}
+  // 统计：按库内 boardId 汇总（库/排样/单据共用），保留首次出现顺序
+  const summaryMap = new Map<string, BoardSummary>()
   let totalCost = 0
   for (const s of results) {
-    boardsByType[s.boardName] = (boardsByType[s.boardName] ?? 0) + 1
-    totalCost += s.priceCents
+    const cur = summaryMap.get(s.boardId)
+    const price = s.priceCents
+    if (cur) {
+      cur.sheets++
+      cur.subtotalCents += price
+    } else {
+      summaryMap.set(s.boardId, {
+        boardId: s.boardId,
+        boardName: s.boardName,
+        material: s.material,
+        thicknessMm: s.thicknessMm,
+        wMm: s.wMm,
+        hMm: s.hMm,
+        sheets: 1,
+        priceCents: price,
+        subtotalCents: price
+      })
+    }
+    totalCost += price
   }
+  const boardSummary = [...summaryMap.values()]
   let exposedM = 0
   let normalM = 0
   for (const s of results) {
@@ -360,20 +385,58 @@ export function nestJob(job: Job): NestResult {
     }
   }
 
-  const unplacedList: UnplacedInfo[] = [...unplaced.values()].map((u) => ({
-    partId: u.part.id,
-    code: u.part.code,
-    name: u.part.name,
-    qty: u.qty,
-    reason:
-      u.part.grain === 'none'
-        ? '板材尺寸或库存不足，无法排下'
-        : u.part.grain === 'length'
-          ? '因纹理要求为竖纹（不可旋转），现有板材排不下'
-          : '因纹理要求为横纹（不可旋转），现有板材排不下'
-  }))
+  const unplacedList: UnplacedInfo[] = [...unplaced.values()].map((u) => {
+    const p = u.part
+    const named = p.boardId ? boardDefs.get(p.boardId) : undefined
+    const pool = boards.filter((b) => boardMatches(b, p, aKey))
+    const usable = (b: Board): [number, number] => [b.wMm - 2 * trim, b.hMm - 2 * trim]
+    const long = Math.max(p.lenMm, p.widMm)
+    const short = Math.min(p.lenMm, p.widMm)
+    let reason: string
+    if (p.boardId && !named) {
+      reason = '指定的板材已不在库里，请重新指定板材或改回自动挑板'
+    } else if (pool.length === 0) {
+      reason = p.boardId
+        ? `指定的板材「${named?.name ?? ''}」与该件不匹配`
+        : `库里没有同厚度、同材质（${aKey.replace('|', 'mm ')}）的板可供自动挑选，请加板或显式指定`
+    } else {
+      // 找一块可用面积最大的板来说明是哪条边超
+      let best: Board | null = null
+      let bestArea = -1
+      for (const b of pool) {
+        const [uw, uh] = usable(b)
+        if (uw * uh > bestArea) {
+          bestArea = uw * uh
+          best = b
+        }
+      }
+      const b = best ?? pool[0]
+      const [uw, uh] = usable(b)
+      if (p.grain === 'length') {
+        if (long > uw && short > uh)
+          reason = `竖纹不可旋转：长边 ${long} 超可用板长 ${uw}、短边 ${short} 超可用板宽 ${uh}（${b.name}，已扣两侧修边）`
+        else if (long > uw)
+          reason = `竖纹不可旋转：长边 ${long} 超出可用板长 ${uw}（${b.name}，已扣两侧修边 ${trim}mm）`
+        else
+          reason = `竖纹不可旋转：短边 ${short} 超出可用板宽 ${uh}（${b.name}，已扣两侧修边 ${trim}mm）`
+      } else if (p.grain === 'width') {
+        if (long > uh && short > uw)
+          reason = `横纹不可旋转：长边 ${long} 超可用板宽 ${uh}、短边 ${short} 超可用板长 ${uw}（${b.name}，已扣两侧修边）`
+        else if (long > uh)
+          reason = `横纹不可旋转：长边 ${long} 超出可用板宽 ${uh}（${b.name}，已扣两侧修边 ${trim}mm）`
+        else
+          reason = `横纹不可旋转：短边 ${short} 超出可用板长 ${uw}（${b.name}，已扣两侧修边 ${trim}mm）`
+      } else {
+        reason = `即使旋转也排不下：件 ${long}×${short}，最接近的板可用幅仅 ${Math.max(uw, uh)}×${Math.min(
+          uw,
+          uh
+        )}（${b.name}，已扣两侧修边 ${trim}mm）`
+      }
+    }
+    return { partId: p.id, code: p.code, name: p.name, qty: u.qty, reason }
+  })
 
-  const baselineBoards = shelfBaseline(job, boards, kerf, trim, results.length)
+  const baselineBoards = shelfBaseline(job, boards, kerf, trim, aKey, results.length)
   const optimizedBoards = results.length
   const savedBoards = Math.max(0, baselineBoards - optimizedBoards)
   const stockShortage = boards
@@ -395,7 +458,7 @@ export function nestJob(job: Job): NestResult {
   return {
     sheets: results,
     boardsUsed: optimizedBoards,
-    boardsByType,
+    boardSummary,
     edgeBandM: {
       exposed: Math.round(exposedM * 100) / 100,
       normal: Math.round(normalM * 100) / 100
@@ -476,6 +539,7 @@ function shelfBaseline(
   boards: Board[],
   kerf: number,
   trim: number,
+  aKey: string,
   optimizedCount: number
 ): number {
   let count = 0
@@ -494,7 +558,7 @@ function shelfBaseline(
       const ph = part.grain === 'width' ? part.lenMm : part.widMm
       const tryCur = (): boolean => {
         const c = cur.value
-        if (!c || !boardMatches(c.b, part)) return false
+        if (!c || !boardMatches(c.b, part, aKey)) return false
         const [uw, uh] = usable(c.b)
         if (c.x + pw <= uw + EPS && c.y + Math.max(c.shelfH, ph) <= uh + EPS) {
           if (c.x === 0 && c.shelfH === 0) c.shelfH = ph
@@ -522,7 +586,7 @@ function shelfBaseline(
           .filter(
             (b) =>
               canOpen(b) &&
-              boardMatches(b, part) &&
+              boardMatches(b, part, aKey) &&
               b.wMm - 2 * trim + EPS >= pw &&
               b.hMm - 2 * trim + EPS >= ph
           )

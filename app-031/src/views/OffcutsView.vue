@@ -18,11 +18,18 @@ const availArea = computed(() =>
 )
 
 function add(): void {
-  if (form.wMm < 50 || form.hMm < 50) {
+  const w = Math.round(Number(form.wMm))
+  const h = Math.round(Number(form.hMm))
+  const th = Math.round(Number(form.thicknessMm))
+  if (!Number.isFinite(w) || w <= 0 || !Number.isFinite(h) || h <= 0 || !Number.isFinite(th) || th <= 0) {
+    toast('余料长、宽、厚都必须为正数', 'bad')
+    return
+  }
+  if (w < 50 || h < 50) {
     toast('余料尺寸过小，无再利用价值', 'bad')
     return
   }
-  addManualOffcut({ ...form })
+  addManualOffcut({ ...form, wMm: w, hMm: h, thicknessMm: th })
   toast('余料已登记', 'good')
   showForm.value = false
 }

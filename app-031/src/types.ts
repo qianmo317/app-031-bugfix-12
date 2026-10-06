@@ -97,10 +97,24 @@ export interface UnplacedInfo {
   reason: string
 }
 
+/** 下料单/成本表里「按板种汇总」的唯一行结构（以库内 boardId 为准，不靠名称）。 */
+export interface BoardSummary {
+  boardId: string
+  boardName: string
+  material: string
+  thicknessMm: number
+  wMm: number
+  hMm: number
+  sheets: number
+  priceCents: number
+  subtotalCents: number
+}
+
 export interface NestResult {
   sheets: SheetResult[]
   boardsUsed: number
-  boardsByType: Record<string, number>
+  /** 按板种汇总（板种以库内 boardId 为键，库/排样/单据共用这一份） */
+  boardSummary: BoardSummary[]
   edgeBandM: { exposed: number; normal: number }
   unplaced: UnplacedInfo[]
   baselineBoards: number // 随手排（朴素顺板）需要的张数
@@ -116,10 +130,13 @@ export interface Job {
   id: string
   name: string
   createdAt: number
+  schemaVersion?: number
   boards: Board[]
   parts: Part[]
   kerfMm: number
   trimMm: number
+  /** 自动挑板所属的「厚度|材质」组；空 boardId 的零件只会在该组板之间选 */
+  autoBoardKey?: string
   useOffcutIds: string[] // 参与本单排样的登记余料
   batchByCabinet: boolean // 按柜体批次分组开料
   result?: NestResult

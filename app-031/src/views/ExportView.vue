@@ -31,6 +31,10 @@ function doPrint(): void {
     toast('至少勾选一项导出内容', 'bad')
     return
   }
+  if (!job.value?.result) {
+    toast('板材库或零件改动后旧排样已作废，请先重新排样再导出，避免发出对不上库的单据', 'bad', 4600)
+    return
+  }
   printJob(route.params.id as string, list)
 }
 function exportJson(): void {
@@ -75,7 +79,7 @@ function exportJson(): void {
       <ul class="small muted">
         <li>排样图：{{ job.result?.sheets.length ?? 0 }} 张板，同柜同色，标注编号与尺寸</li>
         <li>裁切步骤：{{ job.result?.sheets.reduce((a, s) => a + s.steps.length, 0) ?? 0 }} 条刀序（含修边）</li>
-        <li>下料单：{{ job.result ? Object.keys(job.result.boardsByType).length : 0 }} 种板材领料 + 按柜明细 + 封边五金</li>
+        <li>下料单：{{ job.result?.boardSummary.length ?? 0 }} 种板材领料 + 按柜明细 + 封边五金</li>
         <li>标签：{{ job.result?.sheets.reduce((a, s) => a + s.placements.length, 0) ?? 0 }} 张（每块零件 1 张）</li>
       </ul>
     </section>

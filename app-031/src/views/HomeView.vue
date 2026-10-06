@@ -14,7 +14,7 @@ import { toast } from '../lib/ui'
 import { pct, money } from '../lib/format'
 
 const router = useRouter()
-const { state } = useStore()
+const { state, migrationWarnings } = useStore()
 const newName = ref('')
 const showSelfTest = ref(false)
 const report = ref<SelfTestReport | null>(null)
@@ -23,6 +23,7 @@ const fileInput = ref<HTMLInputElement | null>(null)
 
 const jobs = computed(() => state.jobs)
 const availableOffcuts = computed(() => state.offcuts.filter((o) => o.available).length)
+const showMigration = ref(migrationWarnings.value.length > 0)
 
 function totalQty(jobId: string): number {
   const j = state.jobs.find((x) => x.id === jobId)
@@ -109,6 +110,21 @@ function onFile(e: Event): void {
           @change="onFile"
         />
       </div>
+    </section>
+
+    <section v-if="showMigration && migrationWarnings.length > 0" class="panel migration-box no-print">
+      <div class="row">
+        <b>旧项目已按兼容规则接回</b>
+        <div class="spacer" />
+        <button class="sm" @click="showMigration = false">知道了</button>
+      </div>
+      <ul class="small" style="margin: 6px 0 0; padding-left: 18px">
+        <li v-for="(w, i) in migrationWarnings" :key="i">{{ w }}</li>
+      </ul>
+      <p class="small muted" style="margin: 6px 0 0">
+        库为空或只剩一种板时按默认库（18mm 厚板、25mm 厚板、9mm 背板）补齐；零件指向已删除板的编号已改回自动挑板；
+        库被动过的项目，旧排样与已导出的领料单一并作废，请重新排样后再发料。
+      </p>
     </section>
 
     <div class="row wrap" style="margin: 16px 0 10px">
@@ -208,6 +224,11 @@ function onFile(e: Event): void {
 }
 .selftest {
   margin-bottom: 16px;
+}
+.migration-box {
+  margin-top: 14px;
+  border-color: #f0d9b5;
+  background: #fffbeb;
 }
 .empty {
   text-align: center;

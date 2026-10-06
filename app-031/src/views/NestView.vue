@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { getJob, runNest, applyAdjustment, registerOffcuts, useStore } from '../lib/store'
+import { getJob, runNest, applyAdjustment, registerOffcuts, useStore, NestBlockedError } from '../lib/store'
 import { toast } from '../lib/ui'
 import { printJob } from '../lib/print'
 import { pct, money } from '../lib/format'
@@ -66,9 +66,13 @@ function registerAll(): void {
 
 function rerun(): void {
   if (!job.value) return
-  runNest(job.value)
-  activeSheet.value = 0
-  toast('已重新排样', 'good')
+  try {
+    runNest(job.value)
+    activeSheet.value = 0
+    toast('已重新排样', 'good')
+  } catch (err) {
+    if (err instanceof NestBlockedError) toast(`不能排样：${err.blockers[0]}`, 'bad', 4600)
+  }
 }
 
 function onDrop(payload: { instanceId: string; xMm: number; yMm: number }): void {
